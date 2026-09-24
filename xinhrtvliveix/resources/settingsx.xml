@@ -1,0 +1,20 @@
+<settings>
+    <category label="M3U Export">
+        <setting id="epg_enabled" type="bool" label="EPG aktivieren" default="true"/>
+        <setting id="epg_url" type="text" label="EPG URL (XMLTV)" default="http://epg.pw/xmltv"/>
+        <setting id="auto_map" type="bool" label="Automatische EPG-Zuordnung (iptv-org)" default="true"/>
+        <setting id="export_path" type="text" label="Export-Ordner (Pfad manuell eingeben)" default="special://userdata/addon_data/xinhrtvliveix/"/>
+        <setting id="export_path_browse" type="action" label="Export-Ordner (Ordner auswaehlen)" action="RunPlugin(plugin://xinhrtvliveix/?mode=browse_export_path)"/>
+        <setting id="epg_refresh" type="action" label="EPG-Zuordnung aktualisieren" action="RunPlugin(plugin://xinhrtvliveix/?mode=epg_refresh)"/>
+        <setting id="export_m3u" type="action" label="NahroTv Löschen" action="RunPlugin(plugin://xinhrtvliveix/?mode=export_m3u)"/>
+    </category>
+    <category label="Download">
+        <setting id="rec_dest_dir" type="text" label="Download-Ordner (Pfad)" default="/storage/emulated/0/Download"/>
+        <setting id="rec_dest_browse" type="action" label="Download-Ordner auswaehlen" action="RunPlugin(plugin://xinhrtvliveix/?mode=browse_rec_dir)"/>
+    </category>
+    <category label="Timeshift">
+        <setting id="timeshift_auto" type="bool" label="Timeshift immer aktiv (bei jedem Kanal-Start)" default="false"/>
+        <setting id="timeshift_dir" type="text" label="Timeshift Temp-Ordner (leer = Addon-Daten)" default=""/>
+        <setting id="timeshift_dir_browse" type="action" label="Timeshift Ordner auswaehlen" action="RunPlugin(plugin://xinhrtvliveix/?mode=browse_ts_dir)"/>
+    </category>
+</settings>

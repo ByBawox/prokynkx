@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="xinhrtvliveix" name="NahroTv" version="2026.09.02.1" provider-name="ByNahro">
+	<requires>
+		<import addon="xbmc.python" version="3.0.0"/>
+		<import addon="script.module.requests"/>
+	</requires>
+	<extension point="xbmc.python.pluginsource" library="plugin.py">
+		<provides>video</provides>
+	</extension>
+	<extension point="xbmc.addon.metadata">
+		<summary lang="de">ByNahro</summary>
+		<summary lang="en">ByNahro</summary>
+		<description lang="de">NahroTv API Stream</description>
+		<description lang="en">NahroTv API MediaHub</description>
+		<platform>all</platform>
+		<assets>
+			<icon>icon.png</icon>
+		</assets>
+	</extension>
+</addon>
