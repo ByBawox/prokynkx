@@ -1,0 +1,726 @@
+const MEDIAHUBMX_RESOLVER_UA = "MediaHubMX/2";
+const MEDIAURL_RESOLVER_UA = "MediaURL/1";
+const PLAYBACK_UA = "libmpv";
+const CLIENT_VERSION = "3.0.3";
+const DNS_JSON_ACCEPT = "application/dns-json";
+
+const RESOLVER_ENDPOINTS = [
+  {
+    host: "kool.to",
+    path: "/mediahubmx-resolve.json",
+    userAgent: MEDIAHUBMX_RESOLVER_UA,
+  },
+  {
+    host: "vavoo.to",
+    path: "/mediahubmx-resolve.json",
+    userAgent: MEDIAHUBMX_RESOLVER_UA,
+  },
+  {
+    host: "oha.to",
+    path: "/mediaurl-resolve.json",
+    userAgent: MEDIAURL_RESOLVER_UA,
+  },
+  {
+    host: "huhu.to",
+    path: "/mediaurl-resolve.json",
+    userAgent: MEDIAURL_RESOLVER_UA,
+  },
+];
+
+const ALLOWED_PLAY_HOSTS = new Set(RESOLVER_ENDPOINTS.map((endpoint) => endpoint.host));
+const RESOLVER_ENDPOINT_PATHS = new Set(
+  RESOLVER_ENDPOINTS.map((endpoint) => endpoint.path),
+);
+
+export default {
+  async fetch(request) {
+    const requestUrl = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: buildCorsHeaders({
+          "access-control-max-age": "86400",
+        }),
+      });
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/health") {
+      return jsonResponse({
+        ok: true,
+        service: "media-resolver-worker",
+        usage: {
+          playlist: `${requestUrl.origin}/?url=${encodeURIComponent(
+            "https://kool.to/kool-iptv/play/17128499338be117e18642",
+          )}`,
+          debug: `${requestUrl.origin}/?url=${encodeURIComponent(
+            "https://kool.to/kool-iptv/play/17128499338be117e18642",
+          )}&debug=1`,
+        },
+        now: new Date().toISOString(),
+      });
+    }
+
+    if (request.method === "GET" && requestUrl.pathname === "/" && requestUrl.searchParams.get("url")) {
+      return handlePlaylistRequest(requestUrl);
+    }
+
+    if (request.method === "POST" && RESOLVER_ENDPOINT_PATHS.has(requestUrl.pathname)) {
+      return handleResolverProxy(request, requestUrl);
+    }
+
+    return jsonResponse(
+      {
+        error: "usage",
+        message: "Use GET /?url=<play-url> for direct IP playlists or POST resolver paths.",
+        examples: {
+          playlist: `${requestUrl.origin}/?url=${encodeURIComponent(
+            "https://kool.to/kool-iptv/play/17128499338be117e18642",
+          )}`,
+          resolver: `${requestUrl.origin}/mediahubmx-resolve.json`,
+        },
+      },
+      400,
+    );
+  },
+};
+
+async function handlePlaylistRequest(requestUrl) {
+  const originalPlayUrl = requestUrl.searchParams.get("url") || "";
+  const debugEnabled = requestUrl.searchParams.get("debug") === "1";
+  const preferredTransport = normalizeTransport(requestUrl.searchParams.get("transport"));
+  const responseMode = normalizeResponseMode(requestUrl.searchParams.get("mode"));
+
+  const parsedPlayUrl = safeParseUrl(originalPlayUrl);
+  if (!parsedPlayUrl) {
+    return jsonResponse({ error: "invalid_url" }, 400);
+  }
+
+  const playHost = normalizeHost(parsedPlayUrl.hostname);
+  if (!ALLOWED_PLAY_HOSTS.has(playHost)) {
+    return jsonResponse(
+      {
+        error: "unsupported_host",
+        host: playHost,
+        allowedHosts: Array.from(ALLOWED_PLAY_HOSTS),
+      },
+      400,
+    );
+  }
+
+  const payload = normalizePayload({
+    url: originalPlayUrl,
+    language: requestUrl.searchParams.get("language") || "tr",
+    region: requestUrl.searchParams.get("region") || "TR",
+    clientVersion: requestUrl.searchParams.get("clientVersion") || CLIENT_VERSION,
+  });
+
+  const resolverResult = await resolveWithFallback(payload, playHost);
+  if (!resolverResult.ok) {
+    return jsonResponse(
+      {
+        error: "resolver_failed",
+        originalPlayUrl,
+        attempts: resolverResult.attempts,
+      },
+      502,
+    );
+  }
+
+  const dnsCache = new Map();
+  const directPlaylistUrl = await rewriteTargetUrl(
+    resolverResult.resolvedUrl,
+    null,
+    preferredTransport,
+    dnsCache,
+    new Map(),
+  );
+
+  if (responseMode === "redirect") {
+    return new Response(null, {
+      status: 302,
+      headers: buildCorsHeaders({
+        location: directPlaylistUrl,
+        "cache-control": "no-store",
+        "x-resolver-host": resolverResult.resolver.host,
+        "x-resolver-path": resolverResult.resolver.path,
+        "x-resolved-url": resolverResult.resolvedUrl,
+        "x-direct-playlist-url": directPlaylistUrl,
+        "x-playlist-mode": responseMode,
+      }),
+    });
+  }
+
+  if (responseMode === "master") {
+    const masterPlaylist = buildSingleVariantMasterPlaylist(directPlaylistUrl);
+
+    if (debugEnabled) {
+      return jsonResponse({
+        originalPlayUrl,
+        resolver: {
+          host: resolverResult.resolver.host,
+          path: resolverResult.resolver.path,
+        },
+        resolvedUrl: resolverResult.resolvedUrl,
+        directPlaylistUrl,
+        mode: responseMode,
+        playlist: masterPlaylist,
+        attempts: resolverResult.attempts,
+      });
+    }
+
+    return new Response(masterPlaylist, {
+      status: 200,
+      headers: buildCorsHeaders({
+        "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "cache-control": "no-store",
+        "x-resolver-host": resolverResult.resolver.host,
+        "x-resolver-path": resolverResult.resolver.path,
+        "x-resolved-url": resolverResult.resolvedUrl,
+        "x-direct-playlist-url": directPlaylistUrl,
+        "x-playlist-mode": responseMode,
+        "x-playlist-transport": preferredTransport,
+      }),
+    });
+  }
+
+  const playlistResult = await fetchPlaylist(resolverResult.resolvedUrl);
+  if (!playlistResult.ok) {
+    return jsonResponse(
+      {
+        error: "playlist_fetch_failed",
+        originalPlayUrl,
+        resolvedUrl: resolverResult.resolvedUrl,
+        detail: playlistResult.error,
+        status: playlistResult.status || null,
+      },
+      502,
+    );
+  }
+
+  const rewriteReport = new Map();
+  const rewrittenPlaylist = await rewritePlaylistToDirectIps(
+    playlistResult.body,
+    resolverResult.resolvedUrl,
+    preferredTransport,
+    dnsCache,
+    rewriteReport,
+  );
+
+  const playlistHeaders = buildCorsHeaders({
+    "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+    "cache-control": "no-store",
+    "x-resolver-host": resolverResult.resolver.host,
+    "x-resolver-path": resolverResult.resolver.path,
+    "x-resolved-url": resolverResult.resolvedUrl,
+    "x-playlist-transport": preferredTransport,
+  });
+
+  if (debugEnabled) {
+    return jsonResponse({
+      originalPlayUrl,
+      resolver: {
+        host: resolverResult.resolver.host,
+        path: resolverResult.resolver.path,
+      },
+      mode: responseMode,
+      resolvedUrl: resolverResult.resolvedUrl,
+      directPlaylistUrl,
+      playlistSource: playlistResult.finalUrl,
+      transport: preferredTransport,
+      rewrittenHosts: Array.from(rewriteReport.values()),
+      playlist: rewrittenPlaylist,
+      attempts: resolverResult.attempts,
+    });
+  }
+
+  return new Response(rewrittenPlaylist, {
+    status: 200,
+    headers: playlistHeaders,
+  });
+}
+
+async function handleResolverProxy(request, requestUrl) {
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return jsonResponse(
+      {
+        error: "invalid_json",
+        message: "Request body must be valid JSON",
+      },
+      400,
+    );
+  }
+
+  const normalizedPayload = normalizePayload(payload);
+  if (!normalizedPayload.url) {
+    return jsonResponse(
+      {
+        error: "missing_url",
+        message: "Request body must include a non-empty 'url' field",
+      },
+      400,
+    );
+  }
+
+  const sourceUrl = safeParseUrl(normalizedPayload.url);
+  if (!sourceUrl) {
+    return jsonResponse(
+      {
+        error: "invalid_url",
+        message: "The 'url' field must be an absolute URL",
+      },
+      400,
+    );
+  }
+
+  const sourceHost = normalizeHost(sourceUrl.hostname);
+  if (!ALLOWED_PLAY_HOSTS.has(sourceHost)) {
+    return jsonResponse(
+      {
+        error: "unsupported_source_host",
+        host: sourceHost,
+        allowedHosts: Array.from(ALLOWED_PLAY_HOSTS),
+      },
+      400,
+    );
+  }
+
+  const routeResolvers = getResolversForPath(requestUrl.pathname);
+  const preferredResolvers = getOrderedResolvers(sourceHost).filter((resolver) =>
+    routeResolvers.some(
+      (routeResolver) =>
+        routeResolver.host === resolver.host && routeResolver.path === resolver.path,
+    ),
+  );
+
+  for (const resolver of preferredResolvers) {
+    const upstreamResponse = await fetchResolverResponse(resolver, normalizedPayload);
+    if (!upstreamResponse.ok) {
+      continue;
+    }
+
+    return new Response(upstreamResponse.bodyText, {
+      status: upstreamResponse.status,
+      headers: buildCorsHeaders({
+        "content-type": upstreamResponse.contentType,
+        "cache-control": "no-store",
+        "x-resolver-worker": "gunes-tv",
+        "x-upstream-host": resolver.host,
+      }),
+    });
+  }
+
+  return jsonResponse(
+    {
+      error: "resolver_failed",
+      message: "All resolver upstreams failed",
+    },
+    502,
+  );
+}
+
+async function resolveWithFallback(payload, playHost) {
+  const attempts = [];
+
+  for (const resolver of getOrderedResolvers(playHost)) {
+    const response = await fetchResolverResponse(resolver, payload);
+    if (!response.ok) {
+      attempts.push({
+        host: resolver.host,
+        path: resolver.path,
+        status: response.status,
+        error: response.error || null,
+      });
+      continue;
+    }
+
+    const resolvedUrl = extractResolvedUrl(response.json);
+    if (!resolvedUrl) {
+      attempts.push({
+        host: resolver.host,
+        path: resolver.path,
+        status: response.status,
+        error: "resolved_url_not_found",
+      });
+      continue;
+    }
+
+    return {
+      ok: true,
+      resolver,
+      resolvedUrl,
+      attempts,
+    };
+  }
+
+  return {
+    ok: false,
+    attempts,
+  };
+}
+
+async function fetchResolverResponse(resolver, payload) {
+  const upstreamUrl = `https://${resolver.host}${resolver.path}`;
+
+  try {
+    const upstreamResponse = await fetch(upstreamUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        accept: "application/json",
+        "user-agent": resolver.userAgent,
+      },
+      body: JSON.stringify(payload),
+      cf: {
+        cacheTtl: 0,
+        cacheEverything: false,
+      },
+    });
+
+    const bodyText = await upstreamResponse.text();
+    const contentType =
+      upstreamResponse.headers.get("content-type") ||
+      "application/json; charset=utf-8";
+
+    if (!upstreamResponse.ok) {
+      return {
+        ok: false,
+        status: upstreamResponse.status,
+        error: `HTTP ${upstreamResponse.status}`,
+        bodyText,
+        contentType,
+      };
+    }
+
+    let json;
+    try {
+      json = JSON.parse(bodyText);
+    } catch {
+      return {
+        ok: false,
+        status: upstreamResponse.status,
+        error: "invalid_json_response",
+        bodyText,
+        contentType,
+      };
+    }
+
+    return {
+      ok: true,
+      status: upstreamResponse.status,
+      json,
+      bodyText,
+      contentType,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error instanceof Error ? error.message : "Unknown upstream error",
+      bodyText: "",
+      contentType: "application/json; charset=utf-8",
+    };
+  }
+}
+
+async function fetchPlaylist(targetUrl) {
+  try {
+    const response = await fetch(targetUrl, {
+      method: "GET",
+      headers: {
+        "user-agent": PLAYBACK_UA,
+        accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+      },
+      redirect: "follow",
+      cf: {
+        cacheTtl: 0,
+        cacheEverything: false,
+      },
+    });
+
+    const body = await response.text();
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: `HTTP ${response.status}`,
+      };
+    }
+
+    return {
+      ok: true,
+      body,
+      finalUrl: response.url || targetUrl,
+      contentType: response.headers.get("content-type") || "",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error instanceof Error ? error.message : "Unknown playlist error",
+    };
+  }
+}
+
+async function rewritePlaylistToDirectIps(content, baseUrl, transport, dnsCache, rewriteReport) {
+  const lines = content.split("\n");
+  const rewrittenLines = await Promise.all(
+    lines.map(async (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return line;
+      }
+
+      if (trimmed.startsWith("#")) {
+        return rewriteTagUris(line, baseUrl, transport, dnsCache, rewriteReport);
+      }
+
+      return rewriteTargetUrl(trimmed, baseUrl, transport, dnsCache, rewriteReport);
+    }),
+  );
+
+  return rewrittenLines.join("\n");
+}
+
+async function rewriteTagUris(line, baseUrl, transport, dnsCache, rewriteReport) {
+  const matches = Array.from(line.matchAll(/URI="([^"]+)"/g));
+  if (!matches.length) {
+    return line;
+  }
+
+  let rewrittenLine = "";
+  let lastIndex = 0;
+
+  for (const match of matches) {
+    const originalFragment = match[0];
+    const originalUri = match[1];
+    const absoluteDirectUrl = await rewriteTargetUrl(
+      originalUri,
+      baseUrl,
+      transport,
+      dnsCache,
+      rewriteReport,
+    );
+
+    rewrittenLine += line.slice(lastIndex, match.index);
+    rewrittenLine += originalFragment.replace(originalUri, absoluteDirectUrl);
+    lastIndex = match.index + originalFragment.length;
+  }
+
+  rewrittenLine += line.slice(lastIndex);
+  return rewrittenLine;
+}
+
+async function rewriteTargetUrl(value, baseUrl, transport, dnsCache, rewriteReport) {
+  const absoluteUrl = safeParseUrl(value, baseUrl);
+  if (!absoluteUrl) {
+    return value;
+  }
+
+  if (!/^https?:$/i.test(absoluteUrl.protocol)) {
+    return absoluteUrl.toString();
+  }
+
+  const originalPort = absoluteUrl.port;
+
+  if (isIpv4Address(absoluteUrl.hostname)) {
+    absoluteUrl.protocol = `${transport}:`;
+    absoluteUrl.port = originalPort;
+    return absoluteUrl.toString();
+  }
+
+  const ipv4Address = await resolveIpv4Address(absoluteUrl.hostname, dnsCache);
+  if (!ipv4Address) {
+    return absoluteUrl.toString();
+  }
+
+  rewriteReport.set(absoluteUrl.hostname, {
+    host: absoluteUrl.hostname,
+    ip: ipv4Address,
+  });
+
+  absoluteUrl.protocol = `${transport}:`;
+  absoluteUrl.hostname = ipv4Address;
+  absoluteUrl.port = originalPort;
+
+  return absoluteUrl.toString();
+}
+
+async function resolveIpv4Address(hostname, dnsCache) {
+  const normalizedHost = normalizeHost(hostname);
+  if (!normalizedHost) {
+    return null;
+  }
+
+  if (dnsCache.has(normalizedHost)) {
+    return dnsCache.get(normalizedHost);
+  }
+
+  const dnsUrl = new URL("https://cloudflare-dns.com/dns-query");
+  dnsUrl.searchParams.set("name", normalizedHost);
+  dnsUrl.searchParams.set("type", "A");
+
+  try {
+    const response = await fetch(dnsUrl.toString(), {
+      headers: {
+        accept: DNS_JSON_ACCEPT,
+      },
+      cf: {
+        cacheTtl: 60,
+        cacheEverything: false,
+      },
+    });
+
+    if (!response.ok) {
+      dnsCache.set(normalizedHost, null);
+      return null;
+    }
+
+    const payload = await response.json();
+    const answer = Array.isArray(payload?.Answer)
+      ? payload.Answer.find((item) => item?.type === 1 && isIpv4Address(item?.data))
+      : null;
+
+    const resolvedAddress = answer?.data || null;
+    dnsCache.set(normalizedHost, resolvedAddress);
+    return resolvedAddress;
+  } catch {
+    dnsCache.set(normalizedHost, null);
+    return null;
+  }
+}
+
+function extractResolvedUrl(payload) {
+  if (Array.isArray(payload)) {
+    const firstEntry = payload.find((item) => typeof item?.url === "string" && item.url.trim());
+    return firstEntry?.url?.trim() || "";
+  }
+
+  if (payload && typeof payload === "object" && typeof payload.url === "string") {
+    return payload.url.trim();
+  }
+
+  return "";
+}
+
+function getResolversForPath(pathname) {
+  return RESOLVER_ENDPOINTS.filter((endpoint) => endpoint.path === pathname);
+}
+
+function getOrderedResolvers(playHost) {
+  const sameFamily = getResolverFamily(playHost);
+  const primaryResolvers = [];
+  const fallbackResolvers = [];
+
+  for (const resolver of RESOLVER_ENDPOINTS) {
+    if (resolver.host === playHost) {
+      primaryResolvers.unshift(resolver);
+      continue;
+    }
+
+    if (sameFamily.has(resolver.host)) {
+      primaryResolvers.push(resolver);
+      continue;
+    }
+
+    fallbackResolvers.push(resolver);
+  }
+
+  return [...primaryResolvers, ...fallbackResolvers];
+}
+
+function getResolverFamily(host) {
+  const normalizedHost = normalizeHost(host);
+
+  if (normalizedHost === "kool.to" || normalizedHost === "vavoo.to") {
+    return new Set(["kool.to", "vavoo.to"]);
+  }
+
+  return new Set(["oha.to", "huhu.to"]);
+}
+
+function normalizePayload(payload) {
+  const safePayload =
+    payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+
+  return {
+    ...safePayload,
+    url: typeof safePayload.url === "string" ? safePayload.url.trim() : "",
+    language:
+      typeof safePayload.language === "string" && safePayload.language.trim()
+        ? safePayload.language.trim()
+        : "tr",
+    region:
+      typeof safePayload.region === "string" && safePayload.region.trim()
+        ? safePayload.region.trim()
+        : "TR",
+    clientVersion:
+      typeof safePayload.clientVersion === "string" && safePayload.clientVersion.trim()
+        ? safePayload.clientVersion.trim()
+        : CLIENT_VERSION,
+  };
+}
+
+function normalizeTransport(value) {
+  return String(value || "http").trim().toLowerCase() === "https" ? "https" : "http";
+}
+
+function normalizeResponseMode(value) {
+  const normalized = String(value || "master").trim().toLowerCase();
+  if (normalized === "inline" || normalized === "redirect") {
+    return normalized;
+  }
+  return "master";
+}
+
+function buildSingleVariantMasterPlaylist(mediaPlaylistUrl) {
+  return [
+    "#EXTM3U",
+    "#EXT-X-VERSION:3",
+    '#EXT-X-STREAM-INF:BANDWIDTH=8000000,NAME="direct"',
+    mediaPlaylistUrl,
+  ].join("\n");
+}
+
+function safeParseUrl(value, baseUrl) {
+  try {
+    return baseUrl ? new URL(value, baseUrl) : new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHost(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/.*$/, "");
+}
+
+function isIpv4Address(value) {
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(String(value || ""));
+}
+
+function buildCorsHeaders(extraHeaders = {}) {
+  return {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "content-type, accept, user-agent",
+    ...extraHeaders,
+  };
+}
+
+function jsonResponse(payload, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(payload, null, 2), {
+    status,
+    headers: buildCorsHeaders({
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...extraHeaders,
+    }),
+  });
+}
